@@ -119,7 +119,10 @@ func (f *Future) Done(sender autorest.Sender) (bool, error) {
 	if err := f.pt.updatePollingState(f.pt.provisioningStateApplicable()); err != nil {
 		return false, err
 	}
-	if err := f.pt.updateHeaders(); err != nil {
+	if err := f.pt.initPollingMethod(); err != nil {
+		return false, err
+	}
+	if err := f.pt.updatePollingMethod(); err != nil {
 		return false, err
 	}
 	return f.pt.hasTerminated(), f.pt.pollingError()
@@ -165,8 +168,12 @@ func (f Future) WaitForCompletion(ctx context.Context, client autorest.Client) e
 // polling duration has been exceeded.  It will retry failed polling attempts based on
 // the retry value defined in the client up to the maximum retry attempts.
 func (f *Future) WaitForCompletionRef(ctx context.Context, client autorest.Client) error {
-	ctx, cancel := context.WithTimeout(ctx, client.PollingDuration)
-	defer cancel()
+	if d := client.PollingDuration; d != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+
 	done, err := f.Done(client)
 	for attempts := 0; !done; done, err = f.Done(client) {
 		if attempts >= client.RetryAttempts {
@@ -264,7 +271,7 @@ type pollingTracker interface {
 	// these methods can differ per tracker
 
 	// checks the response headers and status code to determine the polling mechanism
-	updateHeaders() error
+	updatePollingMethod() error
 
 	// checks the response for tracker-specific error conditions
 	checkForErrors() error
@@ -273,6 +280,10 @@ type pollingTracker interface {
 	provisioningStateApplicable() bool
 
 	// methods common to all trackers
+
+	// initializes a tracker's polling URL and method, called for each iteration.
+	// these values can be overridden by each polling tracker as required.
+	initPollingMethod() error
 
 	// initializes the tracker's internal state, call this when the tracker is created
 	initializeState() error
@@ -370,7 +381,7 @@ func (pt *pollingTrackerBase) initializeState() error {
 		pt.updateErrorFromResponse()
 		return pt.pollingError()
 	}
-	return nil
+	return pt.initPollingMethod()
 }
 
 func (pt pollingTrackerBase) getProvisioningState() *string {
@@ -421,6 +432,7 @@ func (pt *pollingTrackerBase) pollForStatus(sender autorest.Sender) error {
 	} else {
 		// check response body for error content
 		pt.updateErrorFromResponse()
+		err = pt.pollingError()
 	}
 	return err
 }
@@ -552,13 +564,33 @@ func (pt pollingTrackerBase) baseCheckForErrors() error {
 	return nil
 }
 
+// default initialization of polling URL/method.  each verb tracker will update this as required.
+func (pt *pollingTrackerBase) initPollingMethod() error {
+	if ao, err := getURLFromAsyncOpHeader(pt.resp); err != nil {
+		return err
+	} else if ao != "" {
+		pt.URI = ao
+		pt.Pm = PollingAsyncOperation
+		return nil
+	}
+	if lh, err := getURLFromLocationHeader(pt.resp); err != nil {
+		return err
+	} else if lh != "" {
+		pt.URI = lh
+		pt.Pm = PollingLocation
+		return nil
+	}
+	// it's ok if we didn't find a polling header, this will be handled elsewhere
+	return nil
+}
+
 // DELETE
 
 type pollingTrackerDelete struct {
 	pollingTrackerBase
 }
 
-func (pt *pollingTrackerDelete) updateHeaders() error {
+func (pt *pollingTrackerDelete) updatePollingMethod() error {
 	// for 201 the Location header is required
 	if pt.resp.StatusCode == http.StatusCreated {
 		if lh, err := getURLFromLocationHeader(pt.resp); err != nil {
@@ -614,7 +646,7 @@ type pollingTrackerPatch struct {
 	pollingTrackerBase
 }
 
-func (pt *pollingTrackerPatch) updateHeaders() error {
+func (pt *pollingTrackerPatch) updatePollingMethod() error {
 	// by default we can use the original URL for polling and final GET
 	if pt.URI == "" {
 		pt.URI = pt.resp.Request.URL.String()
@@ -672,7 +704,7 @@ type pollingTrackerPost struct {
 	pollingTrackerBase
 }
 
-func (pt *pollingTrackerPost) updateHeaders() error {
+func (pt *pollingTrackerPost) updatePollingMethod() error {
 	// 201 requires Location header
 	if pt.resp.StatusCode == http.StatusCreated {
 		if lh, err := getURLFromLocationHeader(pt.resp); err != nil {
@@ -728,7 +760,7 @@ type pollingTrackerPut struct {
 	pollingTrackerBase
 }
 
-func (pt *pollingTrackerPut) updateHeaders() error {
+func (pt *pollingTrackerPut) updatePollingMethod() error {
 	// by default we can use the original URL for polling and final GET
 	if pt.URI == "" {
 		pt.URI = pt.resp.Request.URL.String()
@@ -822,7 +854,7 @@ func createPollingTracker(resp *http.Response) (pollingTracker, error) {
 	// this initializes the polling header values, we do this during creation in case the
 	// initial response send us invalid values; this way the API call will return a non-nil
 	// error (not doing this means the error shows up in Future.Done)
-	return pt, pt.updateHeaders()
+	return pt, pt.updatePollingMethod()
 }
 
 // gets the polling URL from the Azure-AsyncOperation header.
